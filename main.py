@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import re
@@ -33,6 +34,26 @@ def load_models(path: Path) -> List[Dict[str, Any]]:
         raise BenchmarkError(f"{path.name} must contain a top-level 'models' list")
 
     return models
+
+
+def select_models(models: List[Dict[str, Any]], model_name: str) -> List[Dict[str, Any]]:
+    matched = [model for model in models if model.get("name") == model_name]
+    if not matched:
+        available = [str(model.get("name", "<unnamed>")) for model in models]
+        raise BenchmarkError(
+            f"model '{model_name}' not found in models.yaml. Available: {', '.join(available)}"
+        )
+    return matched
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="LLM streaming speed benchmark")
+    parser.add_argument(
+        "--model",
+        metavar="NAME",
+        help="benchmark only the model whose name matches models.yaml (default: all models)",
+    )
+    return parser.parse_args()
 
 
 def load_prompts(path: Path) -> List[Tuple[str, str]]:
@@ -226,13 +247,25 @@ def successful_prompt_result(
     }
 
 
+def benchmark_prompt_job(
+    client: OpenAI,
+    model_config: Dict[str, Any],
+    prompt_name: str,
+    prompt: str,
+) -> Dict[str, Any]:
+    try:
+        tokens, seconds, tps, attempts = benchmark_prompt_with_retries(client, model_config, prompt)
+        return successful_prompt_result(prompt_name, tokens, seconds, tps, attempts)
+    except Exception as exc:
+        return failed_prompt_result(prompt_name, exc)
+
+
 def benchmark_model(
     model_config: Dict[str, Any],
     prompts: List[Tuple[str, str]],
 ) -> Dict[str, Any]:
     model_name = model_config.get("name", "<unnamed>")
     prompt_results: List[Dict[str, Any]] = []
-    model_tps: List[float] = []
 
     try:
         client = create_client(model_config)
@@ -246,16 +279,25 @@ def benchmark_model(
             "prompts": prompt_results,
         }
 
-    for prompt_name, prompt in prompts:
-        try:
-            tokens, seconds, tps, attempts = benchmark_prompt_with_retries(client, model_config, prompt)
-        except Exception as exc:
-            prompt_results.append(failed_prompt_result(prompt_name, exc))
-            continue
+    prompt_results_by_index: Dict[int, Dict[str, Any]] = {}
+    max_prompt_workers = max(1, len(prompts))
 
-        model_tps.append(tps)
-        prompt_results.append(successful_prompt_result(prompt_name, tokens, seconds, tps, attempts))
+    with ThreadPoolExecutor(max_workers=max_prompt_workers) as executor:
+        futures = {
+            executor.submit(benchmark_prompt_job, client, model_config, prompt_name, prompt): index
+            for index, (prompt_name, prompt) in enumerate(prompts)
+        }
 
+        for future in as_completed(futures):
+            index = futures[future]
+            prompt_results_by_index[index] = future.result()
+
+    prompt_results = [prompt_results_by_index[index] for index in range(len(prompts))]
+    model_tps = [
+        prompt_result["tps"]
+        for prompt_result in prompt_results
+        if prompt_result["status"] == "success"
+    ]
     avg_tps = average(model_tps)
     return {
         "model": model_name,
@@ -304,8 +346,12 @@ def write_output(results: Dict[str, Any]) -> Path:
 
 
 def main() -> int:
+    args = parse_args()
+
     try:
         models = load_models(MODELS_PATH)
+        if args.model is not None:
+            models = select_models(models, args.model)
         prompts = load_prompts(PROMPTS_PATH)
     except Exception as exc:
         print(f"配置读取失败: {exc}", file=sys.stderr)
@@ -319,6 +365,7 @@ def main() -> int:
     print("TPS = usage.completion_tokens / seconds from first generated delta to stream end")
     print(f"Retry count per prompt: {RETRY_COUNT}")
     print(f"Running models in parallel with max_workers={max_workers}")
+    print(f"Running prompts per model in parallel with max_workers={max(1, len(prompts))}")
     print()
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -356,8 +403,12 @@ def main() -> int:
         "finished_at": datetime.now().astimezone().isoformat(),
         "retry_count": RETRY_COUNT,
         "parallelism": {
-            "scope": "models",
-            "max_workers": max_workers,
+            "models": {
+                "max_workers": max_workers,
+            },
+            "prompts_per_model": {
+                "max_workers": max(1, len(prompts)),
+            },
         },
         "tps_formula": "usage.completion_tokens / seconds from first generated delta to stream end",
         "models": ordered_model_results,
